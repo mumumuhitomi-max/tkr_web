@@ -60,3 +60,12 @@ def api_goethe(ss_min: int = 1, ss_max: int = 40,
         logging.error("GOETHE API ERROR: %s", e)
         traceback.print_exc()
         return JSONResponse({"error": "goethe_failed", "message": str(e), "forum": [], "umeda": [], "program": []}, status_code=200)
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "tkr_web",
+        "version": "1.0.1",
+        "message": "Takarazuka Link Finder API is running.",
+        "endpoints": ["/ping", "/api/program", "/api/bro", "/api/goethe"]
+    }
