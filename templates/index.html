@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Takarazuka Link Finder — ローカル</title>
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg: linear-gradient(135deg,#fff1f2 0%,#ffffff 35%,#f1f5f9 100%); }
+    body { background: var(--bg); font-family: Inter, 'Noto Sans JP', system-ui, -apple-system, Segoe UI, Roboto, 'Helvetica Neue', Arial; }
+    .card { background: rgba(255,255,255,0.72); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.6); border-radius: 16px; box-shadow: 0 10px 30px rgba(2,6,23,0.08); }
+    .btn { border-radius: 12px; padding: 10px 14px; font-weight: 600; }
+    .btn-primary { background:#0f172a; color:#fff; }
+    .btn-primary:hover { background:#1f2937; }
+    .badge { display:inline-flex; align-items:center; border-radius:999px; background:#f1f5f9; color:#334155; padding: 2px 8px; font-size:12px;}
+    a.link { color:#2563eb; text-decoration:underline; }
+    img.thumb { height:64px; border-radius:8px; transition: transform .15s ease; }
+    img.thumb:hover { transform:scale(1.03); }
+  </style>
+</head>
+<body>
+  <header class="px-6 py-10">
+    <div class="max-w-6xl mx-auto">
+      <h1 class="text-4xl font-extrabold tracking-tight text-slate-900">Takarazuka Link Finder</h1>
+      <p class="text-slate-600 mt-2">宝塚 ONLINE 商品探測器 — ローカル（API: http://127.0.0.1:8000）</p>
+      <div class="grid md:grid-cols-3 gap-4 mt-6">
+        <div class="card p-4">
+          <h2 class="font-semibold mb-3">BRO 予測</h2>
+          <div class="space-y-3">
+            <div>
+              <label class="text-sm text-slate-600">プレフィックス (YYMMDDB)</label>
+              <input id="prefix" class="w-full rounded-xl border border-slate-200 px-3 py-2" value="2511161"/>
+            </div>
+            <div class="grid grid-cols-2 gap-2">
+              <div><label class="text-sm text-slate-600">SS 最小</label><input id="ss_min" type="number" value="1" class="w-full rounded-xl border border-slate-200 px-3 py-2"/></div>
+              <div><label class="text-sm text-slate-600">SS 最大</label><input id="ss_max" type="number" value="40" class="w-full rounded-xl border border-slate-200 px-3 py-2"/></div>
+            </div>
+            <button id="bro_btn" class="btn btn-primary w-full">検索開始</button>
+          </div>
+        </div>
+        <div class="card p-4">
+          <h2 class="font-semibold mb-3">公演プログラム 検索</h2>
+          <div class="space-y-3">
+            <div><label class="text-sm text-slate-600">年度</label><input id="year" type="number" value="2025" class="w-full rounded-xl border border-slate-200 px-3 py-2"/></div>
+            <div><label class="text-sm text-slate-600">キーワード（スペース区切り）</label><input id="q" value="Goethe 花組" class="w-full rounded-xl border border-slate-200 px-3 py-2"/></div>
+            <button id="prg_btn" class="btn btn-primary w-full">検索開始</button>
+          </div>
+        </div>
+        <div class="card p-4">
+          <h2 class="font-semibold mb-3">一発 Goethe（花組）</h2>
+          <p class="text-sm text-slate-600 mb-2">Forum=2511161 / Umeda=2512011</p>
+          <button id="goethe_btn" class="btn btn-primary w-full">一括検索</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="px-6 pb-16">
+    <div class="max-w-6xl mx-auto grid lg:grid-cols-2 gap-6">
+      <div class="card p-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-semibold">BRO 結果</h3>
+          <div class="flex gap-2">
+            <button class="btn" onclick="exportCSV('bro_results.csv', broRows)">CSV</button>
+            <button class="btn" onclick="copyLinks(broRows)">コピー</button>
+          </div>
+        </div>
+        <div id="bro_out" class="mt-3 text-sm text-slate-700"></div>
+      </div>
+
+      <div class="card p-4">
+        <div class="flex items-center justify-between">
+          <h3 class="font-semibold">公演プログラム 結果</h3>
+          <div class="flex gap-2">
+            <button class="btn" onclick="exportCSV('program_results.csv', prgRows)">CSV</button>
+            <button class="btn" onclick="copyLinks(prgRows)">コピー</button>
+          </div>
+        </div>
+        <div id="prg_out" class="mt-3 text-sm text-slate-700"></div>
+      </div>
+
+      <div class="card p-4 lg:col-span-2">
+        <div class="flex items-center justify-between">
+          <h3 class="font-semibold">Goethe 一括 結果</h3>
+          <div class="flex gap-2">
+            <button class="btn" onclick="exportCSV('goethe_bro_results.csv', [...gForum, ...gUmeda])">CSV</button>
+            <button class="btn" onclick="copyLinks([...gForum, ...gUmeda])">コピー</button>
+          </div>
+        </div>
+        <div class="mt-4">
+          <div class="font-semibold mb-2">Forum（2511161）</div>
+          <div id="forum_out"></div>
+        </div>
+        <div class="mt-6">
+          <div class="font-semibold mb-2">Umeda（2512011）</div>
+          <div id="umeda_out"></div>
+        </div>
+        <div class="mt-6">
+          <div class="font-semibold mb-2">Program 検索</div>
+          <div class="flex gap-2 mb-2">
+            <button class="btn" onclick="exportCSV('goethe_program_results.csv', gProgram)">CSV</button>
+            <button class="btn" onclick="copyLinks(gProgram)">コピー</button>
+          </div>
+          <div id="goethe_prg_out"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const API_BASE = "http://127.0.0.1:8000";
+
+    let broRows = [];
+    let prgRows = [];
+    let gForum = [], gUmeda = [], gProgram = [];
+
+    function rowHTML(r){
+      return `<tr class="border-t">
+        <td class="py-2 pr-4">${r.ss ?? ""}</td>
+        <td class="py-2 pr-4">${r.tail ?? ""}</td>
+        <td class="py-2 pr-4">${r.status ?? ""}</td>
+        <td class="py-2 pr-4">${r.title ?? ""}</td>
+        <td class="py-2 pr-4">${r.url ? `<a class="link" target="_blank" href="${r.url}">open</a>` : ""}</td>
+        <td class="py-2">${r.image_url ? `<img class="thumb" src="${r.image_url}">` : ""}</td>
+      </tr>`;
+    }
+    function broTable(rows){
+      return `<div class="overflow-x-auto"><table class="w-full text-left">
+        <thead><tr class="text-slate-500 text-xs">
+          <th class="py-2 pr-4">SS</th><th class="py-2 pr-4">Tail</th><th class="py-2 pr-4">Status</th>
+          <th class="py-2 pr-4">Title</th><th class="py-2 pr-4">Link</th><th class="py-2">Image</th>
+        </tr></thead>
+        <tbody>${rows.map(rowHTML).join("")}</tbody></table></div>`;
+    }
+    function prgTable(rows){
+      return `<div class="overflow-x-auto"><table class="w-full text-left">
+        <thead><tr class="text-slate-500 text-xs">
+          <th class="py-2 pr-4">Title</th><th class="py-2 pr-4">Release</th>
+          <th class="py-2 pr-4">Code</th><th class="py-2 pr-4">Venue</th><th class="py-2">Link</th>
+        </tr></thead>
+        <tbody>${
+          rows.map(r=>`<tr class="border-t">
+            <td class="py-2 pr-4">${r.title||""}</td>
+            <td class="py-2 pr-4">${r.release_date||""}</td>
+            <td class="py-2 pr-4">${r.code||""}</td>
+            <td class="py-2 pr-4"><span class="badge">${r.venue_group||""}</span></td>
+            <td class="py-2">${r.url?`<a class="link" target="_blank" href="${r.url}">open</a>`:""}</td>
+          </tr>`).join("")
+        }</tbody></table></div>`;
+    }
+    function toCSV(rows){
+      if(!rows || !rows.length) return "";
+      const cols = Object.keys(rows[0]);
+      const esc = s => `"${String(s??"").replace(/"/g,'""')}"`;
+      return [cols.join(","), ...rows.map(r=>cols.map(c=>esc(r[c])).join(","))].join("\n");
+    }
+    function exportCSV(name, rows){
+      const blob = new Blob([toCSV(rows)], {type:"text/csv;charset=utf-8;"});
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+    }
+    function copyLinks(rows){
+      const txt = rows.filter(r=>r?.url).map(r=>r.url).join("\n");
+      navigator.clipboard.writeText(txt || "");
+      alert("リンクをコピーしました！");
+    }
+
+    document.getElementById("bro_btn").onclick = async () => {
+      const prefix = document.getElementById("prefix").value.trim();
+      const ss_min = document.getElementById("ss_min").value.trim();
+      const ss_max = document.getElementById("ss_max").value.trim();
+      const params = new URLSearchParams({prefix, ss_min, ss_max});
+      const res = await fetch(`${API_BASE}/api/bro?${params.toString()}`);
+      if(!res.ok){ alert("BRO 取得に失敗しました"); return; }
+      const data = await res.json();
+      broRows = data.results || [];
+      document.getElementById("bro_out").innerHTML = broTable(broRows);
+    };
+
+    document.getElementById("prg_btn").onclick = async () => {
+      const year = document.getElementById("year").value.trim();
+      const q = document.getElementById("q").value.trim().split(/\s+/).filter(Boolean);
+      const params = new URLSearchParams({year});
+      q.forEach(t => params.append("q", t));
+      const res = await fetch(`${API_BASE}/api/program?${params.toString()}`);
+      if(!res.ok){ alert("プログラム取得に失敗しました"); return; }
+      const data = await res.json();
+      prgRows = data.results || [];
+      document.getElementById("prg_out").innerHTML = prgTable(prgRows);
+    };
+
+    document.getElementById("goethe_btn").onclick = async () => {
+      const res = await fetch(`${API_BASE}/api/goethe`);
+      if(!res.ok){ alert("Goethe 一括取得に失敗しました"); return; }
+      const data = await res.json();
+      gForum = data.forum || []; gUmeda = data.umeda || []; gProgram = data.program || [];
+      document.getElementById("forum_out").innerHTML = broTable(gForum);
+      document.getElementById("umeda_out").innerHTML = broTable(gUmeda);
+      document.getElementById("goethe_prg_out").innerHTML = prgTable(gProgram);
+    };
+  </script>
+</body>
+</html>
