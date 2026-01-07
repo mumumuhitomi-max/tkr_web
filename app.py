@@ -27,36 +27,56 @@ DEFAULT_HEADERS = {
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
 
+TROUPE_BY_NAME = {
+    "花": {"jp": "花組", "cn": "花组", "emoji": "🌸", "color": "#ec4899"},
+    "月": {"jp": "月組", "cn": "月组", "emoji": "🌙", "color": "#f59e0b"},
+    "雪": {"jp": "雪組", "cn": "雪组", "emoji": "❄️", "color": "#22c55e"},
+    "星": {"jp": "星組", "cn": "星组", "emoji": "⭐️", "color": "#3b82f6"},
+    "宙": {"jp": "宙組", "cn": "宙组", "emoji": "🪐", "color": "#a855f7"},
+}
 TROUPE_MAP = {
-    "1": {"jp": "花組", "cn": "花组", "emoji": "🌸", "color": "#ec4899"},
-    "2": {"jp": "月組", "cn": "月组", "emoji": "🌙", "color": "#f59e0b"},
-    "3": {"jp": "雪組", "cn": "雪组", "emoji": "❄️", "color": "#22c55e"},
-    "4": {"jp": "星組", "cn": "星组", "emoji": "⭐️", "color": "#3b82f6"},
-    "5": {"jp": "宙組", "cn": "宙组", "emoji": "🪐", "color": "#a855f7"},
+    "1": TROUPE_BY_NAME["花"],
+    "2": TROUPE_BY_NAME["月"],
+    "3": TROUPE_BY_NAME["雪"],
+    "4": TROUPE_BY_NAME["星"],
+    "5": TROUPE_BY_NAME["宙"],
 }
 
 # -------------------------
-# HTTP helpers (IMPORTANT)
+# Low-level HTTP helpers
 # -------------------------
 
 def http_get(url: str, timeout: float = 15.0) -> requests.Response:
     return requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
 
-def image_exists(url: str, timeout: float = 12.0) -> bool:
+def http_head(url: str, timeout: float = 10.0) -> requests.Response:
+    return requests.head(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True)
+
+def http_image_ok(url: str, timeout: float = 10.0) -> bool:
     """
-    用 Range GET 探测图片是否存在：
-    - 避免 HEAD 被 403/405 的问题
+    很多站点对 HEAD 会 403/405，导致“全部不存在”的假阴性。
+    所以：先 HEAD；若不行就 GET + Range: bytes=0-0 做轻量探测。
     """
     try:
-        headers = dict(DEFAULT_HEADERS)
-        headers["Range"] = "bytes=0-0"
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True, stream=True)
-        if r.status_code not in (200, 206):
-            return False
-        ct = (r.headers.get("content-type") or "").lower()
-        return ct.startswith("image/") or ("image" in ct)
+        r = http_head(url, timeout=timeout)
+        if r.status_code == 200:
+            ct = (r.headers.get("content-type") or "").lower()
+            return ct.startswith("image/") or ("image" in ct)
+        if r.status_code in (403, 405):
+            # fallback GET (range)
+            rg_headers = dict(DEFAULT_HEADERS)
+            rg_headers["Range"] = "bytes=0-0"
+            rg = requests.get(url, headers=rg_headers, timeout=timeout, allow_redirects=True, stream=True)
+            if rg.status_code in (200, 206):
+                ct = (rg.headers.get("content-type") or "").lower()
+                return ct.startswith("image/") or ("image" in ct)
+        return False
     except Exception:
         return False
+
+# -------------------------
+# Parsing helpers
+# -------------------------
 
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
@@ -73,7 +93,40 @@ def extract_goods_title(html: str) -> str:
         return normalize_text(ttag.get_text())
     return ""
 
+def infer_troupe_from_title(title: str) -> Optional[Dict[str, Any]]:
+    """
+    关键修复：按公演名称/标题里的（花月雪星宙）识别组别
+    常见格式：
+      - "...＜月組＞"
+      - "月組『...』"
+      - "（月組）"
+    """
+    t = title or ""
+    for key, meta in TROUPE_BY_NAME.items():
+        if f"{key}組" in t:
+            return meta
+    return None
+
+def parse_date_and_troupe_from_code(code: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    从 code 里找出形如 25MMDD{B} 的片段（兜底用）
+    """
+    m = re.search(r"(2\d)(\d{2})(\d{2})([1-5])", code)
+    if not m:
+        return None, None
+    yy, mm, dd, b = m.group(1), m.group(2), m.group(3), m.group(4)
+    year = int("20" + yy[1:])
+    try:
+        dt = datetime(year, int(mm), int(dd)).date().isoformat()
+    except Exception:
+        dt = None
+    return dt, b
+
 def extract_images_from_goods_page(html: str) -> List[str]:
+    """
+    直接从商品页抓出 img/goods 的图片（S/L 都收）
+    这对“特殊 L/{code}.jpg”或者 L/stemxxxx.jpg 很有帮助
+    """
     soup = BeautifulSoup(html, "lxml")
     urls = []
     for img in soup.find_all("img"):
@@ -87,7 +140,6 @@ def extract_images_from_goods_page(html: str) -> List[str]:
         if "/img/goods/" in src and src.lower().endswith(".jpg"):
             urls.append(src)
 
-    # unique keep order
     seen = set()
     out = []
     for u in urls:
@@ -96,46 +148,14 @@ def extract_images_from_goods_page(html: str) -> List[str]:
             out.append(u)
     return out
 
-# -------------------------
-# Code -> prefix/date/troupe  (FIX #1)
-# -------------------------
-
-def parse_prefix_from_code(code: str) -> Optional[str]:
+def build_prefix_candidates(
+    base_date_iso: Optional[str],
+    troupe_idx: Optional[str],
+    days_forward: int = 260,
+    days_backward: int = 30
+) -> List[Dict[str, Any]]:
     """
-    关键：小卡 code 是 13 位，例如 2251141100113
-    正确 prefix 通常固定为 code[1:8] => 2511411 (YYMMDD + troupe_idx)
-    这可以避免 regex 误匹配造成组别错乱。
-    """
-    code = (code or "").strip()
-    if len(code) >= 8 and code[0].isdigit():
-        prefix = code[1:8]
-        if re.fullmatch(r"\d{7}", prefix):
-            return prefix
-    return None
-
-def prefix_to_date_troupe(prefix: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    prefix: YYMMDD{B}
-    date: 20YY-MM-DD
-    troupe_idx: B
-    """
-    if not prefix or not re.fullmatch(r"\d{7}", prefix):
-        return None, None
-    yy = prefix[0:2]
-    mm = prefix[2:4]
-    dd = prefix[4:6]
-    b = prefix[6:7]
-    try:
-        year = int("20" + yy)
-        dt = datetime(year, int(mm), int(dd)).date().isoformat()
-    except Exception:
-        dt = None
-    return dt, b
-
-def build_prefix_candidates(base_date_iso: Optional[str], troupe_idx: Optional[str], days_forward: int = 160, days_backward: int = 10) -> List[Dict[str, Any]]:
-    """
-    新人公演等可能在“同一公演”里用另一套 prefix（通常更晚）
-    所以对 base_date 做“向后扩展”，默认 160 天（可按需加大）
+    新人公演/东宝舞写可能比小卡日期晚不少，所以 forward 扩大到 260 天
     """
     if not base_date_iso or not troupe_idx:
         return []
@@ -154,46 +174,20 @@ def build_prefix_candidates(base_date_iso: Optional[str], troupe_idx: Optional[s
     return out
 
 # -------------------------
-# Probing strategies (FIX #2)
+# Probing logic
 # -------------------------
 
-def multi_probe(urls: List[str], timeout: float = 12.0, max_workers: int = 28) -> List[str]:
-    if not urls:
-        return []
-    ok_map: Dict[str, bool] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(image_exists, u, timeout): u for u in urls}
-        for fut in as_completed(futs):
-            u = futs[fut]
-            try:
-                ok_map[u] = bool(fut.result())
-            except Exception:
-                ok_map[u] = False
-    return [u for u in urls if ok_map.get(u)]
-
-def probe_sequence_S(prefix: str, max_images: int, timeout: float, start_n_hint: int = 1, miss_stop: int = 35) -> List[str]:
+def probe_sequence_S(prefix: str, max_images: int, start_n: int, timeout: float, miss_stop: int = 50) -> List[str]:
     """
-    普通定妆/舞写：S/{prefix}-{NNN}.jpg
-    - 先探测 001~005 找到实际起点（很多不是从001开始）
-    - 再顺序扫描，连续 miss_stop 次 miss 结束
+    S/{prefix}-{NNN}.jpg
+    连续 miss_stop 次 miss 后停止
     """
-    # find real start
-    start_n = None
-    for n in range(start_n_hint, min(start_n_hint + 5, 6)):
-        u = f"{BASE}/img/goods/S/{prefix}-{n:03d}.jpg"
-        if image_exists(u, timeout=timeout):
-            start_n = n
-            break
-    if start_n is None:
-        return []
-
-    found: List[str] = []
+    found = []
     misses = 0
     n = start_n
     while len(found) < max_images:
         url = f"{BASE}/img/goods/S/{prefix}-{n:03d}.jpg"
-        ok = image_exists(url, timeout=timeout)
-        if ok:
+        if http_image_ok(url, timeout=timeout):
             found.append(url)
             misses = 0
         else:
@@ -203,37 +197,31 @@ def probe_sequence_S(prefix: str, max_images: int, timeout: float, start_n_hint:
         n += 1
     return found
 
+def guess_start_n_for_prefix(prefix: str, timeout: float, start_range: int = 30) -> Optional[int]:
+    """
+    关键修复：序列不一定从 001 开始，先并发探测 001..030，命中哪个就从哪个开始抓
+    """
+    cand_ns = list(range(1, start_range + 1))
+    urls = [(n, f"{BASE}/img/goods/S/{prefix}-{n:03d}.jpg") for n in cand_ns]
+
+    with ThreadPoolExecutor(max_workers=24) as ex:
+        futs = {ex.submit(http_image_ok, u, timeout): n for n, u in urls}
+        hits = []
+        for fut in as_completed(futs):
+            n = futs[fut]
+            try:
+                if fut.result():
+                    hits.append(n)
+            except Exception:
+                pass
+    return min(hits) if hits else None
+
 def probe_L_code(code: str, timeout: float) -> List[str]:
     """
-    特殊定妆/舞写：L/{code}.jpg
+    特殊定妆・舞写：L/{code}.jpg
     """
     url = f"{BASE}/img/goods/L/{code}.jpg"
-    return [url] if image_exists(url, timeout=timeout) else []
-
-def probe_L_stem_series(code: str, max_images: int, timeout: float, start_suffix: int = 200, miss_stop: int = 45) -> List[str]:
-    """
-    少数公演：L/{stem}{suffix:04d}.jpg
-    例如 stem=2251141100 -> 2251141100229.jpg
-    我们从 0200 开始更贴近常见分配，避免从0001扫太久。
-    """
-    if len(code) < 10:
-        return []
-    stem = code[:10]
-    found: List[str] = []
-    misses = 0
-    s = start_suffix
-    while len(found) < max_images:
-        url = f"{BASE}/img/goods/L/{stem}{s:04d}.jpg"
-        ok = image_exists(url, timeout=timeout)
-        if ok:
-            found.append(url)
-            misses = 0
-        else:
-            misses += 1
-            if misses >= miss_stop:
-                break
-        s += 1
-    return found
+    return [url] if http_image_ok(url, timeout=timeout) else []
 
 # -------------------------
 # APIs
@@ -247,12 +235,12 @@ def ping():
 def api_cards(
     keyword: str = "コレクションカード",
     title_filter: List[str] = Query(default=[]),
-    page_size: int = 80,
+    page_size: int = 120,
     timeout: float = 15.0,
 ):
     """
-    小卡检索：返回 title + code + url + date + troupe（用于前端时间轴）
-    title_filter：多个词 AND 匹配（小写包含）
+    小卡检索：返回 title + code + url + date + troupe（时间轴用）
+    重要修复：troupe 优先按 title 中出现的 花/月/雪/星/宙 识别
     """
     try:
         params = {"search": "search", "keyword": keyword}
@@ -265,7 +253,6 @@ def api_cards(
             if href.startswith("/shop/g/g") and href.endswith("/"):
                 links.append(BASE + href)
 
-        # unique keep order then cut
         uniq = []
         seen = set()
         for u in links:
@@ -276,21 +263,26 @@ def api_cards(
 
         def fetch_one(u: str) -> Dict[str, Any]:
             code = u.rstrip("/").split("/g/g")[-1]
-            prefix = parse_prefix_from_code(code)
-            date_iso, troupe_idx = prefix_to_date_troupe(prefix) if prefix else (None, None)
-            troupe = TROUPE_MAP.get(troupe_idx or "", None)
-
+            # fetch title
             title = ""
             try:
                 rr = http_get(u, timeout=timeout)
                 title = extract_goods_title(rr.text)
             except Exception:
                 title = ""
+            # troupe: title first
+            troupe = infer_troupe_from_title(title)
+            # fallback: code
+            date_iso, troupe_idx = parse_date_and_troupe_from_code(code)
+            if troupe is None and troupe_idx:
+                troupe = TROUPE_MAP.get(troupe_idx)
+            else:
+                # if title gives troupe, also build troupe_idx as best-effort
+                troupe_idx = troupe_idx
 
             return {
                 "url": u,
                 "code": code,
-                "prefix": prefix,
                 "title": title,
                 "date": date_iso,
                 "troupe_idx": troupe_idx,
@@ -298,7 +290,7 @@ def api_cards(
             }
 
         items = []
-        with ThreadPoolExecutor(max_workers=12) as ex:
+        with ThreadPoolExecutor(max_workers=14) as ex:
             futs = [ex.submit(fetch_one, u) for u in uniq]
             for fut in as_completed(futs):
                 items.append(fut.result())
@@ -311,7 +303,7 @@ def api_cards(
                 return all(f in tl for f in filters)
             items = [it for it in items if match(it.get("title", ""))]
 
-        # sort: date desc, then code desc
+        # sort: date desc then code desc
         def sort_key(it: Dict[str, Any]):
             d = it.get("date") or "1900-01-01"
             return (d, it.get("code") or "")
@@ -332,94 +324,108 @@ def api_card_images(
 ):
     """
     一次性“探图”：
-    - 小卡画像：商品页img + L/{code}.jpg
-    - 普通定妆/舞写：S/{prefix}-{NNN}.jpg（prefix 来自 code[1:8]）
-    - 新人公演：自动向后扩展 prefix 候选并探测
-    - 特殊：L/{code}.jpg 以及 L/{stem}{suffix}.jpg
+      A) 小卡商品页能直接拿到的图（S/L都可能）
+      B) 特殊：L/{code}.jpg
+      C) 定妆・舞写：S/{prefix}-{NNN}.jpg（prefix 自动候选扩展 + 自动探测起始 NNN）
+      D) 新人公演/东宝舞写：同样通过候选 prefix 扩展命中；也支持手动补 prefix
     """
     try:
         if not card_url.startswith("http"):
             card_url = BASE + card_url
         code = card_url.rstrip("/").split("/g/g")[-1]
 
-        # fetch card page (sometimes accessible even before full publish)
-        title = ""
-        direct_imgs_ok: List[str] = []
-        try:
-            rr = http_get(card_url, timeout=timeout)
-            html = rr.text
-            title = extract_goods_title(html)
-            direct_imgs = extract_images_from_goods_page(html)
-            direct_imgs_ok = multi_probe(direct_imgs, timeout=timeout) if direct_imgs else []
-        except Exception:
-            title = ""
+        # fetch card page
+        rr = http_get(card_url, timeout=timeout)
+        html = rr.text
+        title = extract_goods_title(html)
 
-        # L/{code}.jpg
-        l_single = probe_L_code(code, timeout=timeout)
+        # troupe: title first (fix #1)
+        troupe = infer_troupe_from_title(title)
+        base_date_iso, troupe_idx = parse_date_and_troupe_from_code(code)
+        if troupe is None and troupe_idx:
+            troupe = TROUPE_MAP.get(troupe_idx)
 
-        # prefix/date/troupe from code[1:8]
-        prefix0 = parse_prefix_from_code(code)
-        base_date_iso, troupe_idx = prefix_to_date_troupe(prefix0) if prefix0 else (None, None)
-        troupe = TROUPE_MAP.get(troupe_idx or "", None)
+        # A) direct imgs from page
+        direct_imgs = extract_images_from_goods_page(html)
+        # validate direct imgs (use image_ok with fallback GET)
+        direct_ok = []
+        if direct_imgs:
+            with ThreadPoolExecutor(max_workers=24) as ex:
+                futs = {ex.submit(http_image_ok, u, timeout): u for u in direct_imgs}
+                for fut in as_completed(futs):
+                    u = futs[fut]
+                    try:
+                        if fut.result():
+                            direct_ok.append(u)
+                    except Exception:
+                        pass
+            # keep order as in page
+            direct_ok_set = set(direct_ok)
+            direct_ok = [u for u in direct_imgs if u in direct_ok_set]
 
-        # build candidate prefixes (auto expand) + manual extra
-        candidates = build_prefix_candidates(base_date_iso, troupe_idx, days_forward=160, days_backward=10)
+        # B) special L/{code}.jpg
+        l_code_imgs = probe_L_code(code, timeout=timeout)
+
+        # Candidate prefixes
+        candidates = build_prefix_candidates(base_date_iso, troupe_idx, days_forward=260, days_backward=30)
+
+        # add manual prefixes
         for p in extra_prefix:
             p = (p or "").strip()
-            if re.fullmatch(r"\d{7}", p):
-                candidates.append({"prefix": p, "date": None, "delta_days": None})
+            if p:
+                candidates.insert(0, {"prefix": p, "date": None, "delta_days": None})
 
-        # sort candidates by closeness
-        def cand_sort(c):
-            dd = c.get("delta_days")
+        # If troupe_idx missing, still allow manual prefixes to work
+        # Light stage: find prefixes where any of 001..030 exists
+        LIGHT_LIMIT = 120
+        full_prefixes: List[Dict[str, Any]] = []
+
+        def light_probe(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            p = c["prefix"]
+            start_n = guess_start_n_for_prefix(p, timeout=timeout, start_range=30)
+            if start_n is None:
+                return None
+            return {**c, "start_n": start_n}
+
+        probe_targets = candidates[:LIGHT_LIMIT] if candidates else []
+        if probe_targets:
+            with ThreadPoolExecutor(max_workers=28) as ex:
+                futs = [ex.submit(light_probe, c) for c in probe_targets]
+                for fut in as_completed(futs):
+                    try:
+                        hit = fut.result()
+                        if hit:
+                            full_prefixes.append(hit)
+                    except Exception:
+                        pass
+
+        # Choose a few prefixes to fully fetch (enough to cover main+rookie)
+        # Sort by abs(delta_days), manual (delta_days None) goes first
+        def rank(x: Dict[str, Any]):
+            dd = x.get("delta_days")
             if dd is None:
-                return 9999
-            return abs(dd)
-        candidates.sort(key=cand_sort)
-
-        # LIGHT probe: check first 5 numbers for each prefix
-        LIGHT_N = 90
+                return (-1, 0)
+            return (0, abs(dd))
+        full_prefixes.sort(key=rank)
         FULL_TOP = 8
-
-        def light_probe(prefix: str) -> bool:
-            # try 001~005 quickly
-            for n in range(1, 6):
-                u = f"{BASE}/img/goods/S/{prefix}-{n:03d}.jpg"
-                if image_exists(u, timeout=timeout):
-                    return True
-            return False
-
-        light_hits: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=28) as ex:
-            futs = {ex.submit(light_probe, c["prefix"]): c for c in candidates[:LIGHT_N]}
-            for fut in as_completed(futs):
-                c = futs[fut]
-                try:
-                    if fut.result():
-                        light_hits.append(c)
-                except Exception:
-                    pass
-
-        # choose prefixes to fully scan:
-        # - prioritize close date (main stills)
-        # - but keep some later hits for rookie
-        light_hits.sort(key=lambda x: (0 if x.get("delta_days") is not None else 1, abs(x.get("delta_days") or 9999)))
-        full_candidates = light_hits[:FULL_TOP]
+        full_prefixes = full_prefixes[:FULL_TOP]
 
         sequences: List[Dict[str, Any]] = []
-        for c in full_candidates:
+        for c in full_prefixes:
             p = c["prefix"]
-            seq = probe_sequence_S(p, max_images=max_images, timeout=timeout, start_n_hint=1)
-            if seq:
+            start_n = int(c.get("start_n") or 1)
+            imgs = probe_sequence_S(p, max_images=max_images, start_n=start_n, timeout=timeout, miss_stop=60)
+            if imgs:
                 sequences.append({
                     "prefix": p,
                     "delta_days": c.get("delta_days"),
                     "date": c.get("date"),
-                    "count": len(seq),
-                    "images": seq,
+                    "start_n": start_n,
+                    "count": len(imgs),
+                    "images": imgs,
                 })
 
-        # classify main vs rookie by delta_days
+        # classify: main vs rookie (rough)
         main = []
         rookie = []
         unknown = []
@@ -427,38 +433,41 @@ def api_card_images(
             dd = s.get("delta_days")
             if dd is None:
                 unknown.append(s)
-            elif dd <= 10:
+            elif dd <= 14:
                 main.append(s)
             else:
                 rookie.append(s)
 
-        # special L stem series
-        l_series = probe_L_stem_series(code, max_images=max_images, timeout=timeout, start_suffix=200)
-
-        # build card_images group (dedup)
-        card_images = list(dict.fromkeys(direct_imgs_ok + l_single))
+        # unify + dedupe images
+        def dedupe_keep_order(arr: List[str]) -> List[str]:
+            seen = set()
+            out = []
+            for u in arr:
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+            return out
 
         return JSONResponse({
             "card_url": card_url,
             "title": title,
             "code": code,
-            "prefix_from_code": prefix0,
             "base_date": base_date_iso,
             "troupe_idx": troupe_idx,
             "troupe": troupe,
             "max_images": max_images,
             "groups": {
-                "card_images": {"count": len(card_images), "images": card_images},
+                "card_images": {
+                    "count": len(dedupe_keep_order(direct_ok + l_code_imgs)),
+                    "images": dedupe_keep_order(direct_ok + l_code_imgs),
+                },
                 "main_stills": {"prefixes": main},
                 "rookie_stills": {"prefixes": rookie},
                 "unknown_prefix_stills": {"prefixes": unknown},
-                "special_L_single": {"count": len(l_single), "images": l_single},
-                "special_L_series": {"count": len(l_series), "images": l_series},
             },
             "debug": {
-                "light_hit_prefixes": [c["prefix"] for c in light_hits],
-                "full_probed_prefixes": [c["prefix"] for c in full_candidates],
                 "extra_prefix": extra_prefix,
+                "light_hits": [x["prefix"] for x in full_prefixes],
             }
         })
     except Exception as e:
