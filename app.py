@@ -5,322 +5,353 @@ from typing import List, Optional, Dict, Any
 import logging, traceback, re, time
 import requests
 from bs4 import BeautifulSoup
-
-# 你原来已有的逻辑（不改）
-from logic import bro_guess, program_search
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Takarazuka Link Finder", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本地联调方便；上线后建议收紧
+    allow_origins=["*", "null", "http://127.0.0.1:5173", "http://localhost:5173"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+BASE = "https://shop.tca-pictures.net"
+SEARCH_URL = f"{BASE}/shop/goods/search.aspx"
 
-def _http_get(url: str, timeout: float = 15.0) -> requests.Response:
-    headers = {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6,zh-CN;q=0.5",
-        "Connection": "keep-alive",
-    }
-    return requests.get(url, headers=headers, timeout=timeout)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
 
-def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
+# -------------------------
+# Helpers
+# -------------------------
 
-def _extract_goods_links_from_html(html: str) -> List[str]:
+def http_get(url: str, timeout: float = 15.0) -> requests.Response:
+    return requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+
+def http_head_ok(url: str, timeout: float = 10.0) -> bool:
+    try:
+        r = requests.head(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True)
+        return r.status_code == 200 and (r.headers.get("content-type", "").startswith("image/") or "image" in r.headers.get("content-type", ""))
+    except Exception:
+        return False
+
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def extract_goods_title(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    # 先尝试商品标题常见位置
+    h1 = soup.find("h1")
+    if h1:
+        t = normalize_text(h1.get_text())
+        if t:
+            return t
+    # fallback: title tag
+    ttag = soup.find("title")
+    if ttag:
+        return normalize_text(ttag.get_text())
+    return ""
+
+def extract_images_from_goods_page(html: str) -> List[str]:
     """
-    从搜索页抓取 /shop/g/gXXXXXXXX/ 这种商品小卡链接
+    从商品详情页直接提取图片（通常能拿到 L 尺寸图）
     """
     soup = BeautifulSoup(html, "lxml")
     urls = []
-    for a in soup.select("a[href]"):
-        href = a.get("href") or ""
-        # 统一成绝对链接
-        if href.startswith("/shop/g/g"):
-            urls.append("https://shop.tca-pictures.net" + href)
-        elif href.startswith("https://shop.tca-pictures.net/shop/g/g"):
-            urls.append(href)
-    # 只保留 /shop/g/g123456/ 形式
-    urls = [u for u in urls if re.search(r"/shop/g/g\d+/?$", u)]
-    return _dedupe_keep_order(urls)
-
-def cards_search(keyword: str, title_filter: List[str], timeout: float = 15.0) -> List[Dict[str, str]]:
-    """
-    你最新研究的第 1 步：爬搜索界面的“小卡链接”
-    """
-    # 注意：TCA 的搜索参数有点怪，这里按你给的示例做（search=x & search=search）
-    # keyword 需要 URL 编码，但 requests 会帮我们处理 params
-    url = "https://shop.tca-pictures.net/shop/goods/search.aspx"
-    params = {
-        "search": "x",
-        "keyword": keyword,
-        "search": "search",
-    }
-    r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=timeout)
-    r.raise_for_status()
-
-    urls = _extract_goods_links_from_html(r.text)
-
-    # title_filter：这里做“宽松过滤”：只要商品页 HTML 中命中任意一个词即可
-    # （避免你之前那种“必须全部命中”导致全被过滤掉）
-    tf = [t.strip() for t in title_filter if t and t.strip()]
-    results: List[Dict[str, str]] = []
-
-    if not tf:
-        for u in urls:
-            m = re.search(r"/g/g(\d+)/?$", u)
-            results.append({"url": u, "code": m.group(1) if m else ""})
-        return results
-
-    for u in urls:
-        try:
-            rr = _http_get(u, timeout=timeout)
-            html = rr.text
-            hit = False
-            for t in tf:
-                if t.lower() in html.lower():
-                    hit = True
-                    break
-            if hit:
-                m = re.search(r"/g/g(\d+)/?$", u)
-                results.append({"url": u, "code": m.group(1) if m else ""})
-        except Exception:
-            # 过滤失败不要影响全局
+    for img in soup.find_all("img"):
+        src = img.get("src") or ""
+        if not src:
             continue
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = BASE + src
+        if "/img/goods/" in src and src.lower().endswith(".jpg"):
+            urls.append(src)
+    # 去重保持顺序
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
-    return results
-
-def derive_image_prefix_candidates(card_code: str) -> List[str]:
+def guess_prefix_candidates_from_code(code: str) -> List[str]:
     """
-    你最新研究的第 2 步：从小卡 code 推导图片前缀（如 2511411）
-    经验规则：优先从 code 中提取 YYMM + troupe + ??? 组合
-    但你现在已经能从 card -> prefix_candidates/picked_prefix 得到稳定结果
-    所以这里给一个“尽量不误伤”的候选策略：
-    - 如果 code 是 13 位：2251141100113（例）
-      我们先尝试：25 11 41 1  -> 2511411（你贴的 picked_prefix 就是它）
+    你之前的规律：YYMMDDB（B=组序号）
+    这里我们保留：从 card 的 code 推出 prefix candidates（用于 S/{prefix}-{NNN}.jpg）
+    code 是 13 位形如 2251141100113
+    我们会从中抽取 YYMMDD + B 的组合候选
     """
-    digits = re.sub(r"\D+", "", card_code or "")
-    cands = []
+    # 找到类似 25 11 14 1 的段（Goethe 是 2511411）
+    # 经验：code 中会包含 YYMMDD + troupeIdx
+    # 例如 2251141100113 -> 2511411 在中间
+    m = re.findall(r"(2\d)(\d{2})(\d{2})([1-5])", code)  # 2Y + MM + DD + B
+    candidates = []
+    for yy, mm, dd, b in m:
+        candidates.append(f"{yy}{mm}{dd}{b}")
+    # 也尝试更宽松：抓 25xxxx? 7 位
+    m2 = re.findall(r"(2\d\d{5}[1-5])", code)
+    candidates += m2
+    # 去重
+    seen = set()
+    out = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
-    # 常见：2251141100113 -> 2511411
-    # 取 digits 的第 3-8 位当 YYMM??，再拼 troupe 位
-    # 更稳：直接用正则抓 "2511411" 这种 7 位
-    # 这里按照你成功案例：从 digits 中构造 25 + 114 + 11? 不可靠
-    # 所以采用：扫描可能出现的 "25xxxx1" 形式
-    for m in re.finditer(r"(2[0-9]{1}[0-9]{4}[1-5])", digits):
-        # 2 + 6位 + troupe(1-5) => 总长度 8；但你 prefix 是 7 位，所以这里不直接用
-        pass
-
-    # 直接按你提供的成功映射：2251141100113 -> 2511411
-    # 规则：取 digits[2:4]=25? 不对。我们采用固定： "25" + digits[3:7] + digits[7]（更贴近你例子）
-    # digits: 2 2 5 1 1 4 1 1 0 0 1 1 3
-    #          0 1 2 3 4 5 6 7 8 9 10 11 12
-    # 目标 2511411 = 25 + 114 + 11? => 25(2-3?) + 114(4-6?) + 1(7?) ——我们直接写成：
-    try:
-        if len(digits) >= 8:
-            yy = digits[2:4]      # "51"（不对）
-            # 所以不用上面这个
-    except Exception:
-        pass
-
-    # 采用更稳定的：从 code 的中间取出 "11411" 这种结构，拼成 "25"+"114"+"11"? ——仍然不通用
-    # 最终：我们以“回退策略”为主：由 API 自己在尝试图片是否存在时自动挑对 prefix。
-    # 给几个可能的前缀：从 code 中提取连续的 6 位 + troupe 位
-    # 这里给一个可工作的候选：取 digits 中的第 3-9 位，滑窗拼成 7 位且以 2 开头（例如 2511411）
-    for i in range(0, max(0, len(digits) - 6)):
-        seg = digits[i:i+7]
-        if re.fullmatch(r"2\d{5}[1-5]", seg):
-            cands.append(seg)
-
-    # 再加一个“经验：25 开头 + 6 位”
-    for i in range(0, max(0, len(digits) - 6)):
-        seg = digits[i:i+6]
-        if re.fullmatch(r"\d{6}", seg):
-            cands.append("25" + seg[-4:] + "1")  # 兜底，保证有候选
-
-    cands = _dedupe_keep_order([c for c in cands if len(c) == 7])
-    return cands[:8]
-
-def probe_images(prefix: str, start: int = 1, max_count: int = 60, timeout: float = 10.0) -> List[str]:
+def probe_sequence_S(prefix: str, start: int, max_images: int, timeout: float, miss_stop: int = 30) -> List[str]:
     """
-    尝试从 https://shop.tca-pictures.net/img/goods/S/{prefix}-{NNN}.jpg 连续探测图片
-    规则：允许中间少量断档（防止只因为某一张缺就提前停止）
+    探测 S/{prefix}-{NNN}.jpg，最多 max_images，连续 miss_stop 次未命中就停止。
     """
     found = []
-    miss_streak = 0
-    max_miss_streak = 8  # 连续 8 张不存在就停
-    for n in range(start, start + max_count):
-        url = f"https://shop.tca-pictures.net/img/goods/S/{prefix}-{n:03d}.jpg"
-        try:
-            # 用 HEAD 更快；若站点不支持 HEAD，则 fallback GET
-            resp = requests.head(url, headers={"User-Agent": UA}, timeout=timeout, allow_redirects=True)
-            if resp.status_code == 200 and (resp.headers.get("content-type","").startswith("image/") or resp.headers.get("content-length")):
-                found.append(url)
-                miss_streak = 0
-            else:
-                miss_streak += 1
-        except Exception:
-            miss_streak += 1
-
-        if miss_streak >= max_miss_streak and len(found) > 0:
-            break
+    misses = 0
+    n = start
+    while len(found) < max_images:
+        url = f"{BASE}/img/goods/S/{prefix}-{n:03d}.jpg"
+        ok = http_head_ok(url, timeout=timeout)
+        if ok:
+            found.append(url)
+            misses = 0
+        else:
+            misses += 1
+            if misses >= miss_stop and len(found) > 0:
+                break
+            # 如果从头开始一直 miss，避免太久：miss_stop 达到也停
+            if misses >= miss_stop and len(found) == 0:
+                break
+        n += 1
     return found
 
-def card_images(card_url: str, timeout: float = 15.0) -> Dict[str, Any]:
+def probe_sequence_L_by_stem(code: str, start_suffix: int, max_images: int, timeout: float, miss_stop: int = 60) -> List[str]:
     """
-    输入小卡链接 => 输出图片列表（自动选出正确 prefix）
+    探测 L/{stem}{suffix:04d}.jpg
+    例：2251141100113 -> stem=2251141100 -> L/2251141100229.jpg 等
     """
-    m = re.search(r"/g/g(\d+)/?$", card_url)
-    code = m.group(1) if m else ""
-
-    prefix_candidates = derive_image_prefix_candidates(code)
-    # 如果候选为空，尝试从 card_url 页面再抽一次
-    if not prefix_candidates:
-        prefix_candidates = []
-
-    picked_prefix = None
-    images: List[str] = []
-
-    # 优先：尝试从候选中找能命中的
-    for p in prefix_candidates:
-        imgs = probe_images(p, start=1, max_count=80, timeout=min(10.0, timeout))
-        if len(imgs) >= 3:
-            picked_prefix = p
-            images = imgs
-            break
-
-    # 兜底：如果候选都不行，做一个小范围 brute force（仅在非常必要时）
-    # 例如你知道 Goethe 是 2511441，但你的小卡 code 推不出
-    if not images:
-        # 尝试从 card_code 中取出可能的 YYMMDD+troupe 结构，构造 25?????
-        # 这里保守一点：只扫 25xxxx1-5 的 7 位前缀（最多 120 次）
-        brute = []
-        digits = re.sub(r"\D+", "", code)
-        # 从 digits 中抓 4 位窗口作为“MMDD”并拼 "25" + MMDD + troupe
-        for i in range(0, max(0, len(digits) - 3)):
-            mmdd = digits[i:i+4]
-            if re.fullmatch(r"\d{4}", mmdd):
-                for troupe in ["1","2","3","4","5"]:
-                    brute.append("25" + mmdd + troupe)
-        brute = _dedupe_keep_order(brute)[:120]
-
-        for p in brute:
-            imgs = probe_images(p, start=1, max_count=60, timeout=min(10.0, timeout))
-            if len(imgs) >= 3:
-                picked_prefix = p
-                images = imgs
-                prefix_candidates = _dedupe_keep_order(prefix_candidates + [p])
+    if len(code) < 10:
+        return []
+    stem = code[:10]
+    found = []
+    misses = 0
+    s = start_suffix
+    while len(found) < max_images:
+        url = f"{BASE}/img/goods/L/{stem}{s:04d}.jpg"
+        ok = http_head_ok(url, timeout=timeout)
+        if ok:
+            found.append(url)
+            misses = 0
+        else:
+            misses += 1
+            if misses >= miss_stop and len(found) > 0:
                 break
+            if misses >= miss_stop and len(found) == 0:
+                break
+        s += 1
+    return found
 
-    return {
-        "card_url": card_url,
-        "code": code,
-        "prefix_candidates": prefix_candidates,
-        "picked_prefix": picked_prefix,
-        "images": images,
-    }
+def probe_single_L_code(code: str, timeout: float) -> List[str]:
+    """
+    探测 L/{code}.jpg 这种“单张直连”
+    """
+    url = f"{BASE}/img/goods/L/{code}.jpg"
+    return [url] if http_head_ok(url, timeout=timeout) else []
 
+def multi_head_probe(urls: List[str], timeout: float = 10.0, max_workers: int = 16) -> List[str]:
+    """
+    并发 HEAD 验证，保序返回有效图片
+    """
+    if not urls:
+        return []
+    ok_map = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(http_head_ok, u, timeout): u for u in urls}
+        for fut in as_completed(futs):
+            u = futs[fut]
+            try:
+                ok_map[u] = bool(fut.result())
+            except Exception:
+                ok_map[u] = False
+    return [u for u in urls if ok_map.get(u)]
+
+# -------------------------
+# API
+# -------------------------
 
 @app.get("/ping")
 def ping():
     return {"ok": True, "msg": "pong"}
 
-
-@app.get("/api/program")
-def api_program(
-    year: int = 2025,
-    q: List[str] = Query(default=[]),
-    delay_min: float = 0.6,
-    delay_max: float = 1.5,
-    timeout: float = 15.0
-):
-    try:
-        rows = program_search(year, q, delay_min, delay_max, timeout)
-        return JSONResponse({"year": year, "queries": q, "results": rows})
-    except Exception as e:
-        logging.error("PROGRAM API ERROR: %s", e)
-        traceback.print_exc()
-        return JSONResponse(
-            {"error": "program_search_failed", "message": str(e), "queries": q, "results": []},
-            status_code=200
-        )
-
-
-@app.get("/api/bro")
-def api_bro(
-    prefix: str,
-    ss_min: int = 1,
-    ss_max: int = 40,
-    delay_min: float = 0.6,
-    delay_max: float = 1.5,
-    timeout: float = 15.0
-):
-    try:
-        rows = bro_guess(prefix, ss_min, ss_max, delay_min, delay_max, timeout)
-        return JSONResponse({"prefix": prefix, "results": rows})
-    except Exception as e:
-        logging.error("BRO API ERROR: %s", e)
-        traceback.print_exc()
-        return JSONResponse({"error": "bro_failed", "message": str(e), "results": []}, status_code=200)
-
-
-@app.get("/api/goethe")
-def api_goethe(
-    ss_min: int = 1, ss_max: int = 40,
-    delay_min: float = 0.6, delay_max: float = 1.6,
-    timeout: float = 15.0
-):
-    try:
-        forum = bro_guess("2511161", ss_min, ss_max, delay_min, delay_max, timeout)
-        umeda = bro_guess("2512011", ss_min, ss_max, delay_min, delay_max, timeout)
-        pro = program_search(2025, ["Goethe", "花組"], delay_min, delay_max, timeout)
-        return JSONResponse({"forum_prefix": "2511161", "umeda_prefix": "2512011",
-                             "forum": forum, "umeda": umeda, "program": pro})
-    except Exception as e:
-        logging.error("GOETHE API ERROR: %s", e)
-        traceback.print_exc()
-        return JSONResponse({"error": "goethe_failed", "message": str(e), "forum": [], "umeda": [], "program": []}, status_code=200)
-
-
-# ✅ 新增：小卡搜索（你现在需要的关键接口）
 @app.get("/api/cards")
 def api_cards(
     keyword: str = "コレクションカード",
     title_filter: List[str] = Query(default=[]),
-    timeout: float = 15.0
+    page_size: int = 40,
+    timeout: float = 15.0,
 ):
+    """
+    Step 1: 搜索卡片（小卡）商品列表，返回 {url, code, title}
+    - keyword 默认：コレクションカード
+    - title_filter：可输入 Goethe / ゲーテ / 花組 等
+    """
     try:
-        rows = cards_search(keyword, title_filter, timeout=timeout)
-        return JSONResponse({"keyword": keyword, "title_filter": title_filter, "results": rows})
+        params = {
+            "search": "search",
+            "keyword": keyword,
+        }
+        r = http_get(SEARCH_URL, timeout=timeout)
+        # 直接请求搜索页需要 query 参数
+        r = requests.get(SEARCH_URL, params=params, headers=DEFAULT_HEADERS, timeout=timeout)
+        html = r.text
+        soup = BeautifulSoup(html, "lxml")
+
+        # 商品列表链接通常是 /shop/g/gXXXXXXXXXXXX/
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("/shop/g/g") and href.endswith("/"):
+                links.append(BASE + href)
+
+        # 去重
+        uniq = []
+        seen = set()
+        for u in links:
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+
+        # 限制数量（避免太大）
+        uniq = uniq[: max(10, page_size)]
+
+        # 拉取每个商品页标题（并发）
+        def fetch_one(u: str) -> Dict[str, str]:
+            code = u.rstrip("/").split("/g/g")[-1]
+            try:
+                rr = http_get(u, timeout=timeout)
+                title = extract_goods_title(rr.text)
+            except Exception:
+                title = ""
+            return {"url": u, "code": code, "title": title}
+
+        items = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futs = [ex.submit(fetch_one, u) for u in uniq]
+            for fut in as_completed(futs):
+                items.append(fut.result())
+
+        # 过滤（title_filter）
+        if title_filter:
+            filters = [f.lower() for f in title_filter if f.strip()]
+            def match(t: str) -> bool:
+                tl = (t or "").lower()
+                return all(f in tl for f in filters)
+            items = [it for it in items if match(it.get("title", ""))]
+
+        # 排序：title 有值的靠前
+        items.sort(key=lambda x: (0 if x.get("title") else 1, x.get("title") or "", x.get("code") or ""))
+        return JSONResponse({"keyword": keyword, "title_filter": title_filter, "results": items})
     except Exception as e:
         logging.error("CARDS API ERROR: %s", e)
         traceback.print_exc()
         return JSONResponse({"error": "cards_failed", "message": str(e), "results": []}, status_code=200)
 
-
-# ✅ 新增：小卡 => 图片序列（你现在需要的关键接口）
 @app.get("/api/card_images")
 def api_card_images(
     card_url: str,
-    timeout: float = 15.0
+    extra_prefix: List[str] = Query(default=[]),
+    max_images: int = 200,
+    start_n: int = 1,
+    timeout: float = 12.0,
 ):
+    """
+    Step 2: 根据小卡链接推测图片链接（最多 max_images 张）
+    支持多种策略：
+    - 直接从商品页提取图片（若有）
+    - L/{code}.jpg 单图
+    - S/{prefix}-{NNN}.jpg 序列（prefix 来自 code 推测 + extra_prefix）
+    - L/{stem}{suffix:04d}.jpg 序列（DEAN 类）
+    """
     try:
-        data = card_images(card_url, timeout=timeout)
-        return JSONResponse(data)
+        if not card_url.startswith("http"):
+            card_url = BASE + card_url
+
+        code = card_url.rstrip("/").split("/g/g")[-1]
+
+        # 先拉商品页
+        rr = http_get(card_url, timeout=timeout)
+        html = rr.text
+        title = extract_goods_title(html)
+        direct_imgs = extract_images_from_goods_page(html)
+
+        prefix_candidates = guess_prefix_candidates_from_code(code)
+        # 增加用户手工补充的 prefix（用于新人公演等特殊情况）
+        for p in extra_prefix:
+            p = p.strip()
+            if p:
+                prefix_candidates.append(p)
+
+        # 去重
+        seen = set()
+        pc = []
+        for p in prefix_candidates:
+            if p not in seen:
+                seen.add(p)
+                pc.append(p)
+        prefix_candidates = pc
+
+        # 策略1：商品页直接提取到的图片（先校验）
+        direct_imgs_ok = multi_head_probe(direct_imgs, timeout=timeout) if direct_imgs else []
+
+        # 策略2：L/{code}.jpg
+        single_L = probe_single_L_code(code, timeout=timeout)
+
+        # 策略3：S/{prefix}-{NNN}.jpg
+        seq_S_all = []
+        picked_prefix_S = None
+        for p in prefix_candidates:
+            seq = probe_sequence_S(p, start=start_n, max_images=max_images, timeout=timeout)
+            if len(seq) > len(seq_S_all):
+                seq_S_all = seq
+                picked_prefix_S = p
+
+        # 策略4：L/{stem}{suffix}.jpg（DEAN / 特殊摄影类）
+        # 从 0200 起步更接近你给的例子（0229），你也可以改成 0001
+        seq_L_stem = probe_sequence_L_by_stem(code, start_suffix=200, max_images=max_images, timeout=timeout)
+
+        # 合并（去重保序）：优先 direct -> single -> S序列 -> L序列
+        merged = []
+        seen2 = set()
+        for block in [direct_imgs_ok, single_L, seq_S_all, seq_L_stem]:
+            for u in block:
+                if u not in seen2:
+                    seen2.add(u)
+                    merged.append(u)
+
+        strategy = {
+            "direct_from_goods_page": len(direct_imgs_ok),
+            "single_L_code": len(single_L),
+            "sequence_S_prefix": picked_prefix_S,
+            "sequence_S_count": len(seq_S_all),
+            "sequence_L_stem_count": len(seq_L_stem),
+        }
+
+        return JSONResponse({
+            "card_url": card_url,
+            "title": title,
+            "code": code,
+            "prefix_candidates": prefix_candidates,
+            "picked_prefix_S": picked_prefix_S,
+            "max_images": max_images,
+            "strategy": strategy,
+            "images": merged,
+        })
     except Exception as e:
         logging.error("CARD_IMAGES API ERROR: %s", e)
         traceback.print_exc()
